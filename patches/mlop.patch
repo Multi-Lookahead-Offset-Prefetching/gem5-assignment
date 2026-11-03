@@ -1,0 +1,389 @@
+diff --git a/src/mem/cache/prefetch/Prefetcher.py b/src/mem/cache/prefetch/Prefetcher.py
+index 1e9079c9a4..4fb1594815 100644
+--- a/src/mem/cache/prefetch/Prefetcher.py
++++ b/src/mem/cache/prefetch/Prefetcher.py
+@@ -601,6 +601,24 @@ class BOPPrefetcher(QueuedPrefetcher):
+     on_inst = False
+ 
+ 
++class MLOPPrefetcher(QueuedPrefetcher):
++    type = "MLOPPrefetcher"
++    cxx_class = "gem5::prefetch::MLOP"
++    cxx_header = "mem/cache/prefetch/mlop.hh"
++
++    amt_entries = Param.Unsigned(256, "Direct-mapped access map entries")
++    evaluation_period = Param.Unsigned(500, "L1-D misses per scoring window")
++    max_offset = Param.Unsigned(16, "Positive and negative block offsets")
++    max_prefetches = Param.Unsigned(16, "Candidate limit per access")
++
++    queue_squash = True
++    queue_filter = True
++    cache_snoop = True
++    on_miss = True
++    on_inst = False
++    prefetch_on_pf_hit = False
++
++
+ class SmsPrefetcher(QueuedPrefetcher):
+     # Paper: https://web.eecs.umich.edu/~twenisch/papers/isca06.pdf
+     type = "SmsPrefetcher"
+diff --git a/src/mem/cache/prefetch/SConscript b/src/mem/cache/prefetch/SConscript
+index ad00d6c09e..a9a7026ff3 100644
+--- a/src/mem/cache/prefetch/SConscript
++++ b/src/mem/cache/prefetch/SConscript
+@@ -37,13 +37,14 @@ SimObject('Prefetcher.py', sim_objects=[
+     'DeltaCorrelatingPredictionTables', 'DCPTPrefetcher',
+     'IrregularStreamBufferPrefetcher', 'SlimAMPMPrefetcher',
+     'BOPPrefetcher', 'SBOOEPrefetcher', 'STeMSPrefetcher', 'PIFPrefetcher',
+-    'FetchDirectedPrefetcher'
++    'FetchDirectedPrefetcher', 'MLOPPrefetcher'
+     ])
+ 
+ Source('access_map_pattern_matching.cc')
+ Source('base.cc')
+ Source('multi.cc')
+ Source('bop.cc')
++Source('mlop.cc')
+ Source('delta_correlating_prediction_tables.cc')
+ Source('irregular_stream_buffer.cc')
+ Source('indirect_memory.cc')
+diff --git a/src/mem/cache/prefetch/mlop.cc b/src/mem/cache/prefetch/mlop.cc
+new file mode 100644
+index 0000000000..1d7b894e39
+--- /dev/null
++++ b/src/mem/cache/prefetch/mlop.cc
+@@ -0,0 +1,222 @@
++/*
++ * Copyright (c) 2026 MLOP assignment contributors
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met: redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer;
++ * redistributions in binary form must reproduce the above copyright
++ * notice, this list of conditions and the following disclaimer in the
++ * documentation and/or other materials provided with the distribution;
++ * neither the name of the copyright holders nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "mem/cache/prefetch/mlop.hh"
++
++#include <algorithm>
++#include <cstdlib>
++#include <limits>
++#include <set>
++
++#include "base/intmath.hh"
++#include "base/logging.hh"
++#include "params/MLOPPrefetcher.hh"
++
++namespace gem5
++{
++namespace prefetch
++{
++
++MLOP::MLOPStats::MLOPStats(statistics::Group *parent)
++    : statistics::Group(parent),
++      ADD_STAT(trainingAccesses, statistics::units::Count::get(),
++               "L1 data misses used to train MLOP"),
++      ADD_STAT(evaluationWindows, statistics::units::Count::get(),
++               "completed offset scoring windows"),
++      ADD_STAT(amtReplacements, statistics::units::Count::get(),
++               "direct-mapped access map replacements"),
++      ADD_STAT(candidates, statistics::units::Count::get(),
++               "unique MLOP prefetch candidates"),
++      ADD_STAT(duplicateCandidates, statistics::units::Count::get(),
++               "duplicate winners suppressed on the same access")
++{}
++
++MLOP::MLOP(const MLOPPrefetcherParams &p)
++    : Queued(p),
++      amtEntries(p.amt_entries),
++      evaluationPeriod(p.evaluation_period),
++      maxOffset(p.max_offset),
++      maxPrefetches(p.max_prefetches),
++      maps(amtEntries),
++      statsMLOP(this)
++{
++    fatal_if(!isPowerOf2(blkSize),
++             "%s: cache block size must be a power of two", name());
++    fatal_if(!isPowerOf2(amtEntries), "%s: AMT size must be a power of two",
++             name());
++    fatal_if(evaluationPeriod == 0 ||
++                 evaluationPeriod > std::numeric_limits<uint16_t>::max(),
++             "%s: evaluation period must be in 1..65535", name());
++    fatal_if(maxOffset == 0 || maxOffset >= MapBlocks,
++             "%s: max offset must be in 1..63 blocks", name());
++    fatal_if(maxPrefetches == 0 || maxPrefetches > Levels,
++             "%s: max prefetches must be in 1..16", name());
++
++    // Small offsets win ties, then the positive offset. Both directions
++    // are candidates; the paper does not prescribe a complete offset list.
++    for (unsigned distance = 1; distance <= maxOffset; ++distance) {
++        offsets.push_back(distance);
++        offsets.push_back(-static_cast<int>(distance));
++    }
++    scores.resize(offsets.size());
++    winners.fill(0);
++}
++
++void
++MLOP::notify(const CacheAccessProbeArg &acc, const PrefetchInfo &pfi)
++{
++    // A prefetch-generated miss must not train another prefetch.
++    if (!acc.pkt->cmd.isHWPrefetch()) {
++        Queued::notify(acc, pfi);
++    }
++}
++
++void
++MLOP::train(MapEntry &entry, unsigned position)
++{
++    const uint64_t current_bit = uint64_t{1} << position;
++
++    // Test the current access against predecessors in the same map.
++    // The oldest matching predecessor gives the greatest valid lookahead.
++    // 'aged' records predecessors older than the 15-position history, so
++    // repeated accesses to one block are handled correctly.
++    for (size_t index = 0; index < offsets.size(); ++index) {
++        const int predecessor = static_cast<int>(position) - offsets[index];
++        if (predecessor < 0 || predecessor >= MapBlocks) {
++            continue;
++        }
++        const uint64_t bit = uint64_t{1} << predecessor;
++        if (!(entry.seen & bit)) {
++            continue;
++        }
++
++        unsigned lead = 0;
++        if (entry.aged & bit) {
++            lead = Levels;
++        } else {
++            for (unsigned i = 0; i < entry.recentCount; ++i) {
++                if (entry.recent[i] == predecessor) {
++                    lead = entry.recentCount - i;
++                    break;
++                }
++            }
++        }
++        for (unsigned level = 0; level < lead; ++level) {
++            ++scores[index][level];
++        }
++    }
++
++    if (entry.recentCount == RecentAccesses) {
++        entry.aged |= uint64_t{1} << entry.recent[0];
++        std::move(entry.recent.begin() + 1, entry.recent.end(),
++                  entry.recent.begin());
++        entry.recent[RecentAccesses - 1] = position;
++    } else {
++        entry.recent[entry.recentCount++] = position;
++    }
++    entry.seen |= current_bit;
++}
++
++void
++MLOP::selectWinners()
++{
++    for (unsigned level = 0; level < Levels; ++level) {
++        uint16_t best_score = 0;
++        winners[level] = 0;
++        for (size_t i = 0; i < offsets.size(); ++i) {
++            if (scores[i][level] > best_score) {
++                best_score = scores[i][level];
++                winners[level] = offsets[i];
++            }
++            scores[i][level] = 0;
++        }
++    }
++    accessesInWindow = 0;
++    statsMLOP.evaluationWindows++;
++}
++
++void
++MLOP::calculatePrefetch(const PrefetchInfo &pfi,
++                        std::vector<AddrPriority> &addresses,
++                        const CacheAccessor &)
++{
++    const Addr block = blockIndex(pfi.getAddr());
++    const Addr region = block / MapBlocks;
++    const unsigned position = block % MapBlocks;
++    MapEntry &entry = maps[region & (amtEntries - 1)];
++
++    if (!entry.valid || entry.region != region ||
++        entry.secure != pfi.isSecure()) {
++        if (entry.valid) {
++            statsMLOP.amtReplacements++;
++        }
++        entry = MapEntry{};
++        entry.valid = true;
++        entry.secure = pfi.isSecure();
++        entry.region = region;
++    }
++
++    train(entry, position);
++    statsMLOP.trainingAccesses++;
++    if (++accessesInWindow == evaluationPeriod) {
++        selectWinners();
++    }
++
++    std::set<Addr> emitted;
++    const Addr last_block = std::numeric_limits<Addr>::max() / blkSize;
++    for (unsigned level = 0; level < Levels; ++level) {
++        const int offset = winners[level];
++        if (offset == 0) {
++            continue;
++        }
++        const Addr distance = std::abs(offset);
++        if ((offset < 0 && block < distance) ||
++            (offset > 0 && block > last_block - distance)) {
++            continue;
++        }
++        const Addr target_block =
++            offset > 0 ? block + distance : block - distance;
++        const Addr target = target_block * blkSize;
++        if (!samePage(target, pfi.getAddr())) {
++            continue;
++        }
++        if (!emitted.insert(target).second) {
++            statsMLOP.duplicateCandidates++;
++            continue;
++        }
++        // gem5's queue favors larger priority values. Level 1 is first.
++        addresses.emplace_back(target, Levels - level);
++        statsMLOP.candidates++;
++        if (addresses.size() == maxPrefetches) {
++            break;
++        }
++    }
++}
++
++} // namespace prefetch
++} // namespace gem5
+diff --git a/src/mem/cache/prefetch/mlop.hh b/src/mem/cache/prefetch/mlop.hh
+new file mode 100644
+index 0000000000..bbee821151
+--- /dev/null
++++ b/src/mem/cache/prefetch/mlop.hh
+@@ -0,0 +1,106 @@
++/*
++ * Copyright (c) 2026 MLOP assignment contributors
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met: redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer;
++ * redistributions in binary form must reproduce the above copyright
++ * notice, this list of conditions and the following disclaimer in the
++ * documentation and/or other materials provided with the distribution;
++ * neither the name of the copyright holders nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef __MEM_CACHE_PREFETCH_MLOP_HH__
++#define __MEM_CACHE_PREFETCH_MLOP_HH__
++
++#include <array>
++#include <cstdint>
++#include <vector>
++
++#include "base/statistics.hh"
++#include "mem/cache/prefetch/queued.hh"
++
++namespace gem5
++{
++
++struct MLOPPrefetcherParams;
++
++namespace prefetch
++{
++
++/** Multi-Lookahead Offset Prefetcher (DPC3 2019). */
++class MLOP : public Queued
++{
++  private:
++    static constexpr unsigned MapBlocks = 64;
++    static constexpr unsigned Levels = 16;
++    static constexpr unsigned RecentAccesses = Levels - 1;
++
++    struct MapEntry
++    {
++        bool valid = false;
++        bool secure = false;
++        Addr region = 0;
++        uint64_t seen = 0;
++        // Positions that occurred before the last 15 accesses. This extra
++        // mask makes repeated-position lookahead tests unambiguous.
++        uint64_t aged = 0;
++        std::array<uint8_t, RecentAccesses> recent{};
++        unsigned recentCount = 0;
++    };
++
++    const unsigned amtEntries;
++    const unsigned evaluationPeriod;
++    const unsigned maxOffset;
++    const unsigned maxPrefetches;
++
++    std::vector<MapEntry> maps;
++    std::vector<int> offsets;
++    std::vector<std::array<uint16_t, Levels>> scores;
++    std::array<int, Levels> winners;
++    unsigned accessesInWindow = 0;
++
++    struct MLOPStats : public statistics::Group
++    {
++        MLOPStats(statistics::Group *parent);
++        statistics::Scalar trainingAccesses;
++        statistics::Scalar evaluationWindows;
++        statistics::Scalar amtReplacements;
++        statistics::Scalar candidates;
++        statistics::Scalar duplicateCandidates;
++    } statsMLOP;
++
++    void train(MapEntry &entry, unsigned position);
++    void selectWinners();
++
++  public:
++    MLOP(const MLOPPrefetcherParams &p);
++
++    void notify(const CacheAccessProbeArg &acc,
++                const PrefetchInfo &pfi) override;
++
++    void calculatePrefetch(const PrefetchInfo &pfi,
++                           std::vector<AddrPriority> &addresses,
++                           const CacheAccessor &cache) override;
++};
++
++} // namespace prefetch
++} // namespace gem5
++
++#endif // __MEM_CACHE_PREFETCH_MLOP_HH__
