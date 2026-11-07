@@ -1,0 +1,9 @@
+# Built locally by the evaluation script.
+gem5_assignment/mlop_eval/stream
+
+# Generated gem5 outputs other than the selected, committed evidence.
+gem5_assignment/mlop_eval/results/**/config.json
+gem5_assignment/mlop_eval/results/**/citations.bib
+gem5_assignment/mlop_eval/results/**/simout
+gem5_assignment/mlop_eval/results/**/simerr
+gem5_assignment/mlop_eval/results/**/fs/
